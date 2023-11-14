@@ -32,7 +32,7 @@ MODEL_CLASSES = {
     "gpt-neox": (AutoModelForCausalLM, AutoTokenizer),
     "opt": (AutoModelForCausalLM, AutoTokenizer),
     "bloom": (AutoModelForCausalLM, AutoTokenizer),
-    "llama": (AutoModelForCausalLM, LlamaTokenizer),
+    "llama": (AutoModelForCausalLM, AutoTokenizer),
     "t5": (T5ForConditionalGeneration, AutoTokenizer),
     "falcon": (AutoModelForCausalLM, AutoTokenizer),
     "auto": (AutoModelForCausalLM, AutoTokenizer),
@@ -77,13 +77,12 @@ parser.add_argument('--ipex', action='store_true', help="ipex is not enabled now
 parser.add_argument('--jit', action='store_true')
 parser.add_argument('--print-memory', action='store_true')
 parser.add_argument("--token-latency", action="store_true")
-parser.add_argument("--throughput", action="store_true")
 parser.add_argument("--accuracy-only", action="store_true")
 parser.add_argument(
     "--acc-tasks",
     nargs="+",
     default=[
-        "lambada_standard",
+        "piqa",
     ],
     type=str,
     help="tasks list for accuracy validation, only enabled lambada_standard and lambada_standard at present",
@@ -192,16 +191,17 @@ tp_presharded_mode = True if model_name in tp_presharded_models else False
 print_rank0(f"*** Loading the model {model_name}")
 model_type = next((x for x in MODEL_CLASSES.keys() if x in model_name.lower()), 'auto')
 model_class = MODEL_CLASSES[model_type]
-tokenizer = model_class[1].from_pretrained(model_name)
+tokenizer = model_class[1].from_pretrained(model_name, trust_remote_code=True)
 config = AutoConfig.from_pretrained(model_name, torchscript=args.jit, trust_remote_code=True)
 #if not hasattr(config, "text_max_length") and args.prompt is None:
 #    config.text_max_length = int(args.input_tokens) + int(args.max_new_tokens)
 print_rank0("*** model config:", config)
+print_rank0("*** tokenizer config:", tokenizer.__dict__)
 
 if args.benchmark:
     print_mem_usage("pre-from-pretrained")
 
-is_meta_support = not model_type in ["falcon"]
+is_meta_support = not model_type in ["falcon", "auto"]
 
 # Construct model with fake meta tensors, later will be replaced during ds-inference ckpt load
 with deepspeed.OnDevice(dtype=load_dtype, device="meta", enabled=is_meta_support):
@@ -212,6 +212,8 @@ with deepspeed.OnDevice(dtype=load_dtype, device="meta", enabled=is_meta_support
         model = model_class[0].from_config(config, torch_dtype=load_dtype, trust_remote_code=True)
     else:
         model = model_class[0].from_pretrained(model_name, config=config, low_cpu_mem_usage=True, torch_dtype=load_dtype, trust_remote_code=True)
+
+print_rank0("*** model after load", model)
 
 if args.benchmark:
     print_mem_usage("post-from-pretrained")
@@ -256,6 +258,8 @@ model = deepspeed.init_inference(
     **kwargs,
 )
 
+print_rank0("*** model after init_inference", model)
+
 if args.benchmark:
     print_mem_usage("post-ds-inference-init")
 
@@ -265,6 +269,7 @@ if args.benchmark:
 # to ipex
 if args.ipex:
     model = ipex.optimize_transformers(model.eval().to("xpu"), dtype=infer_dtype, inplace=True, device="xpu")
+    print_rank0("*** model after optimize_transformers", model)
 
 # bypass assertion for beam4
 if isinstance(model, deepspeed.InferenceEngine):
@@ -408,8 +413,6 @@ def run_generate(num_tokens, num_input_tokens, num_beams):
     input_sentences = []
     if args.prompt is not None:
         input_sentences.append(args.prompt)
-    elif model_type == "auto":
-        raise SystemExit("[ERROR] model prompt is not supported, please use --prompt for this model: " + args.model_id)
     elif int(num_input_tokens) > 8192:
         prompt = prompt_pool[model_type]["8192"] * int(int(num_input_tokens) / 8192)
     elif num_input_tokens in prompt_pool[model_type]:
@@ -480,25 +483,27 @@ def run_generate(num_tokens, num_input_tokens, num_beams):
         with torch.inference_mode():
             # latency
             for i in range(cycles):
+                if i == cycles - 1:
+                    os.environ["PTI_ENABLE_COLLECTION"] = "1"
                 with torch.autograd.profiler_legacy.profile(enabled=do_profiling, use_xpu=True, record_shapes=True) as prof:
                     t0 = time.time()
                     gen_ids, outputs = generate()
                     if args.cuda:
                         torch.cuda.synchronize()
                     t1 = time.time()
+                if i == cycles - 1:
+                    os.unsetenv("PTI_ENABLE_COLLECTION")
 
                 if do_profiling:
                     torch.save(prof.key_averages().table(sort_by="self_xpu_time_total"), "./profile_{}.pt".format(local_rank))
                     torch.save(prof.table(sort_by="id", row_limit=-1),'./profile_{}_id.pt'.format(local_rank))
-                    torch.save(prof.key_averages(group_by_input_shape=True).table(), "./profile_{}_detail.pt".format(local_rank))
+                    torch.save(prof.key_averages(group_by_input_shape=True).table(sort_by="self_xpu_time_total"), "./profile_{}_detail.pt".format(local_rank))
                     prof.export_chrome_trace("./trace.json")
 
                 gen_ids = list(gen_ids)
                 print_rank0(gen_ids[0][1:])
                 print_rank0("Iteration: %d, Time: %.6f sec" % (i, t1 - t0))
                 print_mem_usage("post-iteration-%d" % i)
-                # if model.config.model_type != 't5':
-                #     assert gen_ids[0][-1] == args.max_new_tokens, "Generated new tokens != max new tokens"
                 if i >= warmup:
                     total_time += (t1 - t0)
                     if args.token_latency:
@@ -523,32 +528,7 @@ def run_generate(num_tokens, num_input_tokens, num_beams):
             print_rank0("Average 2... latency: %.5f sec." % average_2n_latency)
             print_rank0("P90 2... latency: %.5f sec." % p90_latency)
             print_rank0("P99 2... latency: %.5f sec." % p99_latency)
-        print_rank0(f"Generate args: max_new_tokens={num_tokens}, input_tokens={num_input_tokens}, num_beams={num_beams}")
-        print_rank0(
-            f"""
-    *** Performance stats:
-    latency of {args.batch_size} full sentence: {(total_time / (cycles - warmup)):.3f} secs
-    """
-        )
-
-        # benchmark
-        if args.throughput:
-            t0 = time.time()
-            cycles = 5
-            total_new_tokens_generated = 0
-            for i in range(cycles):
-                generated, _ = generate()
-                total_new_tokens_generated += sum(new_tokens for _, _, new_tokens in generated)
-            get_accelerator().synchronize()
-            throughput = (time.time() - t0) / (total_new_tokens_generated)
-
-            print_rank0(
-                f"""
-        *** Performance stats:
-        Throughput per token including tokenize: {throughput*1000:.2f} msecs with (bs={args.batch_size})
-        Start to ready to generate: {t_ready - t_start:.3f} secs.
-        """
-            )
+        print_rank0(f"Generate args: batch_size={args.batch_size}, max_new_tokens={num_tokens}, input_tokens={num_input_tokens}, num_beams={num_beams}")
 
 
 def to_list(obj):
