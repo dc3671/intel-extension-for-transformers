@@ -264,7 +264,7 @@ if args.benchmark:
 
 # to ipex
 if args.ipex:
-    model = ipex.optimize_transformers(model.eval().to("xpu"), dtype=infer_dtype)
+    model = ipex.optimize_transformers(model.eval().to("xpu"), dtype=infer_dtype, inplace=True, device="xpu")
 
 # bypass assertion for beam4
 if isinstance(model, deepspeed.InferenceEngine):
