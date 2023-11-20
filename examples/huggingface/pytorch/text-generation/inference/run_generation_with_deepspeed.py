@@ -191,8 +191,8 @@ tp_presharded_mode = True if model_name in tp_presharded_models else False
 print_rank0(f"*** Loading the model {model_name}")
 model_type = next((x for x in MODEL_CLASSES.keys() if x in model_name.lower()), 'auto')
 model_class = MODEL_CLASSES[model_type]
-tokenizer = model_class[1].from_pretrained(model_name, trust_remote_code=True)
-config = AutoConfig.from_pretrained(model_name, torchscript=args.jit, trust_remote_code=True)
+tokenizer = model_class[1].from_pretrained(model_name)
+config = AutoConfig.from_pretrained(model_name, torchscript=args.jit)
 #if not hasattr(config, "text_max_length") and args.prompt is None:
 #    config.text_max_length = int(args.input_tokens) + int(args.max_new_tokens)
 print_rank0("*** model config:", config)
@@ -209,9 +209,9 @@ with deepspeed.OnDevice(dtype=load_dtype, device="meta", enabled=is_meta_support
     # model to cpu instead of meta device. Use from_config instead to solve the issue for big models.
     # We add the instance type check here since some of the models haven't yet supported from_config.
     if model_class[0] == AutoModelForCausalLM and is_meta_support:
-        model = model_class[0].from_config(config, torch_dtype=load_dtype, trust_remote_code=True)
+        model = model_class[0].from_config(config, torch_dtype=load_dtype)
     else:
-        model = model_class[0].from_pretrained(model_name, config=config, low_cpu_mem_usage=True, torch_dtype=load_dtype, trust_remote_code=True)
+        model = model_class[0].from_pretrained(model_name, config=config, low_cpu_mem_usage=True, torch_dtype=load_dtype)
 
 print_rank0("*** model after load", model)
 
@@ -500,8 +500,9 @@ def run_generate(num_tokens, num_input_tokens, num_beams):
                     torch.save(prof.key_averages(group_by_input_shape=True).table(sort_by="self_xpu_time_total"), "./profile_{}_detail.pt".format(local_rank))
                     prof.export_chrome_trace("./trace.json")
 
-                gen_ids = list(gen_ids)
-                print_rank0(gen_ids[0][1:])
+                # print output per batch
+                for p, o, _ in gen_ids:
+                    print_rank0(f"*** In: {p}\n*** Out: {o[len(p):]}")
                 print_rank0("Iteration: %d, Time: %.6f sec" % (i, t1 - t0))
                 print_mem_usage("post-iteration-%d" % i)
                 if i >= warmup:
